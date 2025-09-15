@@ -1,0 +1,47 @@
+# Example Apache configuration for mod_webp
+
+# Load the module (if not already loaded by apxs -a)
+# LoadModule webp_module modules/mod_webp.so
+
+# Enable WebP conversion for image directories
+<Directory "/var/www/images">
+    # Enable WebP conversion
+    WebPEnabled On
+    
+    # Set WebP quality (0-100)
+    WebPQuality 85.0
+    
+    # Set cache directory for converted images
+    WebPCacheDir /tmp/webp_cache
+    
+    # Apply to image files
+    <FilesMatch "\.(jpe?g|png)$">
+        # Set handler for image conversion
+        SetHandler webp-handler
+    </FilesMatch>
+</Directory>
+
+# Alternative approach using AddHandler
+# AddHandler webp-handler .jpg .jpeg .png
+
+# Ensure cache directory exists and is writable by Apache
+# mkdir -p /tmp/webp_cache
+# chown www-data:www-data /tmp/webp_cache
+# chmod 755 /tmp/webp_cache
+
+# Example for virtual host configuration
+<VirtualHost *:80>
+    ServerName example.com
+    DocumentRoot /var/www/html
+    
+    # Enable WebP for all images in document root
+    <Directory "/var/www/html">
+        WebPEnabled On
+        WebPQuality 80.0
+        WebPCacheDir /var/cache/webp
+        
+        <FilesMatch "\.(jpe?g|png)$">
+            SetHandler webp-handler
+        </FilesMatch>
+    </Directory>
+</VirtualHost>

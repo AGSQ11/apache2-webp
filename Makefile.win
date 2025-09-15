@@ -1,0 +1,38 @@
+# Makefile.win - Windows Makefile for mod_webp Apache module
+
+# Compiler and linker
+CC = cl.exe
+APXS = apxs
+
+# Installation directory
+APACHE_MODULES_DIR = C:\Apache24\modules
+
+# Default paths for libwebp on Windows
+WEBP_INCLUDE = C:\libwebp\include
+WEBP_LIB = C:\libwebp\lib
+
+# Build flags
+CFLAGS = /nologo /O2 /W3 /DWIN32
+INCLUDES = /I$(WEBP_INCLUDE) /I$(APACHE_HOME)\include
+LIBS = /link /LIBPATH:$(WEBP_LIB) webp.lib
+
+# Default target
+all: mod_webp.so
+
+# Build the module
+mod_webp.so: mod_webp.c
+	$(APXS) -c mod_webp.c $(INCLUDES) $(LIBS)
+
+# Install the module
+install: mod_webp.so
+	$(APXS) -i -a mod_webp.la
+
+# Clean build files
+clean:
+	del *.obj *.lib *.exp *.so *.la
+
+# Test compile only
+test-compile:
+	$(APXS) -c mod_webp.c $(INCLUDES) $(LIBS)
+
+.PHONY: all install clean test-compile
