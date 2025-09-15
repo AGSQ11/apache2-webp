@@ -30,6 +30,7 @@
 #include "util_filter.h"
 #include "apr_buckets.h"
 #include "ap_mpm.h"
+#include "apr_thread_mutex.h"
 
 /* libwebp includes */
 #include <webp/encode.h>
@@ -445,35 +446,130 @@ static int is_browser_webp_compatible(request_rec *r) {
     return 0;
 }
 
-/* Create cache directory if it doesn't exist */
+/* Enhanced cache directory creation with better permission handling */
 static int create_cache_directory(request_rec *r, const char *cache_dir) {
+    webp_config *conf = ap_get_module_config(r->per_dir_config, &webp_module);
     apr_status_t rv;
     apr_finfo_t finfo;
+    char *parent_dir, *current_dir;
+    char *dir_copy;
+    char *token, *last;
 
-    /* Check if directory exists */
-    rv = apr_stat(&finfo, cache_dir, APR_FINFO_TYPE, r->pool);
-    if (rv == APR_SUCCESS && finfo.filetype == APR_DIR) {
-        return 1;  /* Directory already exists */
-    }
-
-    /* Try to create directory */
-    rv = apr_dir_make_recursive(cache_dir, APR_FPROT_UREAD | APR_FPROT_UWRITE | APR_FPROT_UEXECUTE |
-                               APR_FPROT_GREAD | APR_FPROT_GEXECUTE, r->pool);
-    if (rv != APR_SUCCESS) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r,
-                      "mod_webp: Failed to create cache directory: %s", cache_dir);
+    if (!cache_dir || !*cache_dir) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "mod_webp: Cache directory path is empty");
         return 0;
     }
 
-    ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r,
-                  "mod_webp: Created cache directory: %s", cache_dir);
-    return 1;
+    /* Check if directory already exists */
+    rv = apr_stat(&finfo, cache_dir, APR_FINFO_TYPE, r->pool);
+    if (rv == APR_SUCCESS) {
+        if (finfo.filetype == APR_DIR) {
+            if (conf->log_level >= 3) {
+                ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                              "mod_webp: Cache directory already exists: %s", cache_dir);
+            }
+            return 1;  /* Directory already exists */
+        } else {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                          "mod_webp: Cache path exists but is not a directory: %s", cache_dir);
+            return 0;
+        }
+    }
+
+    /* Try recursive creation with better permissions */
+    rv = apr_dir_make_recursive(cache_dir,
+                               APR_FPROT_UREAD | APR_FPROT_UWRITE | APR_FPROT_UEXECUTE |
+                               APR_FPROT_GREAD | APR_FPROT_GWRITE | APR_FPROT_GEXECUTE |
+                               APR_FPROT_WREAD | APR_FPROT_WEXECUTE,
+                               r->pool);
+
+    if (rv == APR_SUCCESS) {
+        ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r,
+                      "mod_webp: Successfully created cache directory: %s", cache_dir);
+        return 1;
+    }
+
+    /* If recursive creation failed, try creating parent directories manually */
+    if (conf->log_level >= 2) {
+        ap_log_rerror(APLOG_MARK, APLOG_INFO, rv, r,
+                      "mod_webp: Recursive creation failed, trying manual creation: %s", cache_dir);
+    }
+
+    /* Create a copy for tokenization */
+    dir_copy = apr_pstrdup(r->pool, cache_dir);
+    if (!dir_copy) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "mod_webp: Memory allocation failed for directory path");
+        return 0;
+    }
+
+    /* Build path incrementally */
+    current_dir = apr_pstrdup(r->pool, "");
+
+    /* Handle absolute path */
+    if (dir_copy[0] == '/') {
+        current_dir = apr_pstrcat(r->pool, current_dir, "/", NULL);
+        dir_copy++; /* Skip the leading slash */
+    }
+
+    /* Create each directory level */
+    for (token = apr_strtok(dir_copy, "/", &last); token; token = apr_strtok(NULL, "/", &last)) {
+        current_dir = apr_pstrcat(r->pool, current_dir, token, "/", NULL);
+
+        /* Remove trailing slash for apr_stat */
+        size_t len = strlen(current_dir);
+        if (len > 1 && current_dir[len-1] == '/') {
+            current_dir[len-1] = '\0';
+        }
+
+        /* Check if this level exists */
+        rv = apr_stat(&finfo, current_dir, APR_FINFO_TYPE, r->pool);
+        if (rv != APR_SUCCESS) {
+            /* Create this directory level */
+            rv = apr_dir_make(current_dir,
+                             APR_FPROT_UREAD | APR_FPROT_UWRITE | APR_FPROT_UEXECUTE |
+                             APR_FPROT_GREAD | APR_FPROT_GWRITE | APR_FPROT_GEXECUTE |
+                             APR_FPROT_WREAD | APR_FPROT_WEXECUTE,
+                             r->pool);
+
+            if (rv != APR_SUCCESS) {
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r,
+                              "mod_webp: Failed to create directory level: %s", current_dir);
+                return 0;
+            }
+
+            if (conf->log_level >= 3) {
+                ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                              "mod_webp: Created directory level: %s", current_dir);
+            }
+        }
+
+        /* Restore trailing slash for next iteration */
+        current_dir = apr_pstrcat(r->pool, current_dir, "/", NULL);
+    }
+
+    /* Final verification */
+    rv = apr_stat(&finfo, cache_dir, APR_FINFO_TYPE, r->pool);
+    if (rv == APR_SUCCESS && finfo.filetype == APR_DIR) {
+        ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r,
+                      "mod_webp: Successfully created cache directory: %s", cache_dir);
+        return 1;
+    }
+
+    ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r,
+                  "mod_webp: Failed to create cache directory after all attempts: %s", cache_dir);
+    return 0;
 }
 
-/* Validate cache directory */
+/* Enhanced cache directory validation with smart retry logic */
 static int validate_cache_directory(request_rec *r, const char *cache_dir) {
+    webp_config *conf = ap_get_module_config(r->per_dir_config, &webp_module);
     apr_finfo_t finfo;
     apr_status_t rv;
+    static apr_hash_t *validated_dirs = NULL;
+    static apr_thread_mutex_t *validation_mutex = NULL;
+    int *is_validated;
 
     if (!cache_dir || !*cache_dir) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
@@ -481,31 +577,133 @@ static int validate_cache_directory(request_rec *r, const char *cache_dir) {
         return 0;
     }
 
-    /* Check if directory exists and is writable */
-    rv = apr_stat(&finfo, cache_dir, APR_FINFO_TYPE | APR_FINFO_PROT, r->pool);
-    if (rv != APR_SUCCESS) {
-        /* Try to create it */
-        return create_cache_directory(r, cache_dir);
+    /* Initialize validation cache (thread-safe) */
+    if (!validation_mutex) {
+        apr_thread_mutex_create(&validation_mutex, APR_THREAD_MUTEX_DEFAULT, r->pool);
+        validated_dirs = apr_hash_make(r->pool);
     }
 
+    /* Check if we've already validated this directory in this process */
+    apr_thread_mutex_lock(validation_mutex);
+    is_validated = (int*)apr_hash_get(validated_dirs, cache_dir, APR_HASH_KEY_STRING);
+    apr_thread_mutex_unlock(validation_mutex);
+
+    if (is_validated && *is_validated) {
+        if (conf->log_level >= 3) {
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                          "mod_webp: Cache directory already validated: %s", cache_dir);
+        }
+        return 1;
+    }
+
+    /* Check if directory exists */
+    rv = apr_stat(&finfo, cache_dir, APR_FINFO_TYPE | APR_FINFO_PROT, r->pool);
+    if (rv != APR_SUCCESS) {
+        /* Directory doesn't exist, try to create it */
+        if (conf->log_level >= 2) {
+            ap_log_rerror(APLOG_MARK, APLOG_INFO, rv, r,
+                          "mod_webp: Cache directory does not exist, creating: %s", cache_dir);
+        }
+
+        if (!create_cache_directory(r, cache_dir)) {
+            return 0;
+        }
+
+        /* Re-check after creation */
+        rv = apr_stat(&finfo, cache_dir, APR_FINFO_TYPE | APR_FINFO_PROT, r->pool);
+        if (rv != APR_SUCCESS) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r,
+                          "mod_webp: Cache directory creation failed verification: %s", cache_dir);
+            return 0;
+        }
+    }
+
+    /* Verify it's actually a directory */
     if (finfo.filetype != APR_DIR) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
-                      "mod_webp: Cache path is not a directory: %s", cache_dir);
+                      "mod_webp: Cache path exists but is not a directory: %s", cache_dir);
         return 0;
     }
 
-    /* Check write permissions (simplified check) */
-    char *test_file = apr_psprintf(r->pool, "%s/.webp_test_%d", cache_dir, getpid());
+    /* Test write permissions with unique filename */
+    char *test_file = apr_psprintf(r->pool, "%s/.webp_test_%d_%ld",
+                                   cache_dir, getpid(), (long)apr_time_now());
     apr_file_t *fd;
-    rv = apr_file_open(&fd, test_file, APR_CREATE | APR_WRITE | APR_TRUNCATE,
-                       APR_FPROT_UREAD | APR_FPROT_UWRITE, r->pool);
+
+    rv = apr_file_open(&fd, test_file,
+                       APR_CREATE | APR_WRITE | APR_TRUNCATE | APR_BINARY,
+                       APR_FPROT_UREAD | APR_FPROT_UWRITE | APR_FPROT_GREAD | APR_FPROT_GWRITE,
+                       r->pool);
+
     if (rv == APR_SUCCESS) {
+        /* Write a small test */
+        const char *test_data = "webp_test";
+        apr_size_t bytes_written = strlen(test_data);
+        apr_status_t write_rv = apr_file_write(fd, test_data, &bytes_written);
         apr_file_close(fd);
+
+        /* Clean up test file */
         apr_file_remove(test_file, r->pool);
+
+        if (write_rv != APR_SUCCESS || bytes_written != strlen(test_data)) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, write_rv, r,
+                          "mod_webp: Cache directory write test failed: %s", cache_dir);
+            return 0;
+        }
+
+        /* Mark this directory as validated */
+        apr_thread_mutex_lock(validation_mutex);
+        int *validated = apr_palloc(r->pool, sizeof(int));
+        *validated = 1;
+        apr_hash_set(validated_dirs, apr_pstrdup(r->pool, cache_dir), APR_HASH_KEY_STRING, validated);
+        apr_thread_mutex_unlock(validation_mutex);
+
+        if (conf->log_level >= 2) {
+            ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r,
+                          "mod_webp: Cache directory validated successfully: %s", cache_dir);
+        }
+
         return 1;
     } else {
+        /* Permission error - try to fix permissions */
+        if (conf->log_level >= 1) {
+            ap_log_rerror(APLOG_MARK, APLOG_WARNING, rv, r,
+                          "mod_webp: Cache directory write test failed, attempting to fix permissions: %s", cache_dir);
+        }
+
+        /* Try to set better permissions on existing directory */
+        rv = apr_file_perms_set(cache_dir,
+                               APR_FPROT_UREAD | APR_FPROT_UWRITE | APR_FPROT_UEXECUTE |
+                               APR_FPROT_GREAD | APR_FPROT_GWRITE | APR_FPROT_GEXECUTE |
+                               APR_FPROT_WREAD | APR_FPROT_WEXECUTE);
+
+        if (rv == APR_SUCCESS) {
+            /* Retry the write test */
+            rv = apr_file_open(&fd, test_file,
+                               APR_CREATE | APR_WRITE | APR_TRUNCATE | APR_BINARY,
+                               APR_FPROT_UREAD | APR_FPROT_UWRITE | APR_FPROT_GREAD | APR_FPROT_GWRITE,
+                               r->pool);
+
+            if (rv == APR_SUCCESS) {
+                apr_file_close(fd);
+                apr_file_remove(test_file, r->pool);
+
+                ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r,
+                              "mod_webp: Fixed cache directory permissions: %s", cache_dir);
+
+                /* Mark as validated */
+                apr_thread_mutex_lock(validation_mutex);
+                int *validated = apr_palloc(r->pool, sizeof(int));
+                *validated = 1;
+                apr_hash_set(validated_dirs, apr_pstrdup(r->pool, cache_dir), APR_HASH_KEY_STRING, validated);
+                apr_thread_mutex_unlock(validation_mutex);
+
+                return 1;
+            }
+        }
+
         ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r,
-                      "mod_webp: Cache directory not writable: %s", cache_dir);
+                      "mod_webp: Cache directory not writable and cannot fix permissions: %s", cache_dir);
         return 0;
     }
 }
@@ -974,11 +1172,38 @@ static int webp_handler(request_rec *r) {
         return DECLINED;
     }
 
-    /* Validate cache directory early */
+    /* Validate cache directory early with fallback options */
     if (!validate_cache_directory(r, conf->cache_dir)) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
-                      "mod_webp: Cache directory validation failed");
-        return HTTP_INTERNAL_SERVER_ERROR;
+        /* Try fallback cache directories */
+        const char *fallback_dirs[] = {
+            "/tmp/mod_webp_cache",
+            "/var/tmp/mod_webp_cache",
+            apr_psprintf(r->pool, "/tmp/mod_webp_cache_%d", getpid()),
+            NULL
+        };
+
+        int fallback_success = 0;
+        for (int i = 0; fallback_dirs[i] && !fallback_success; i++) {
+            if (conf->log_level >= 1) {
+                ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r,
+                              "mod_webp: Trying fallback cache directory: %s", fallback_dirs[i]);
+            }
+
+            if (validate_cache_directory(r, fallback_dirs[i])) {
+                /* Update the config to use the working fallback directory */
+                conf->cache_dir = apr_pstrdup(r->pool, fallback_dirs[i]);
+                fallback_success = 1;
+
+                ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r,
+                              "mod_webp: Using fallback cache directory: %s", conf->cache_dir);
+            }
+        }
+
+        if (!fallback_success) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                          "mod_webp: All cache directory options failed, disabling WebP conversion");
+            return HTTP_INTERNAL_SERVER_ERROR;
+        }
     }
 
     /* Check if this is an image request we handle */
