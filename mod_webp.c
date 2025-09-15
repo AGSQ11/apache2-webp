@@ -44,9 +44,24 @@ static void *webp_create_dir_config(apr_pool_t *p, char *dummy);
 static void *webp_merge_dir_config(apr_pool_t *p, void *basev, void *overridesv);
 static int serve_webp_file(request_rec *r, const char *webp_path);
 
+/* Custom function to set float values */
+static const char *webp_set_float_slot(cmd_parms *cmd, void *struct_ptr, const char *arg) {
+    webp_config *conf = (webp_config *)struct_ptr;
+    float val;
+    char *endptr;
+    
+    val = strtod(arg, &endptr);
+    if (*endptr != '\0' || val < 0.0 || val > 100.0) {
+        return "WebPQuality must be a float between 0.0 and 100.0";
+    }
+    
+    *(float *)((char *)struct_ptr + (size_t)cmd->info) = val;
+    return NULL;
+}
+
 /* Configuration directives */
 static const command_rec webp_directives[] = {
-    AP_INIT_TAKE1("WebPQuality", ap_set_float_slot,
+    AP_INIT_TAKE1("WebPQuality", webp_set_float_slot,
                   (void *)APR_OFFSETOF(webp_config, quality),
                   OR_FILEINFO, "Set WebP quality (0.0-100.0)"),
     AP_INIT_FLAG("WebPEnabled", ap_set_flag_slot,
