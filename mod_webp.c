@@ -41,7 +41,12 @@
 #include <errno.h>
 #include <string.h>
 #include <ctype.h>
-#include <unistd.h>
+#ifdef _WIN32
+    #include <process.h>
+    #define getpid _getpid
+#else
+    #include <unistd.h>
+#endif
 
 module AP_MODULE_DECLARE_DATA webp_module;
 
@@ -108,7 +113,7 @@ static int is_image_request(request_rec *r);
 static int create_cache_directory(request_rec *r, const char *cache_dir);
 static int validate_cache_directory(request_rec *r, const char *cache_dir);
 static const char *image_format_to_string(image_format_t format);
-static int is_format_allowed(webp_config *conf, image_format_t format);
+static int is_format_allowed(webp_config *conf, image_format_t format, apr_pool_t *pool);
 
 /* Custom function to set float values */
 static const char *webp_set_float_slot(cmd_parms *cmd, void *struct_ptr, const char *arg) {
@@ -1056,7 +1061,7 @@ static int webp_handler(request_rec *r) {
 }
 
 /* Module initialization function */
-static int webp_init_module(apr_pool_t *pconf, apr_pool_t *plog, apr_pool_t *ptemp, server_rec *s) {
+static void webp_init_module(apr_pool_t *pchild, server_rec *s) {
     ap_log_error(APLOG_MARK, APLOG_INFO, 0, s,
                  "mod_webp: Enterprise WebP module version 2.0 initialized");
 
@@ -1074,10 +1079,10 @@ static int webp_init_module(apr_pool_t *pconf, apr_pool_t *plog, apr_pool_t *pte
         ap_log_error(APLOG_MARK, APLOG_ERR, 0, s,
                      "mod_webp: libwebp version %d.%d.%d is too old (minimum: 1.0.0)",
                      major, minor, revision);
-        return HTTP_INTERNAL_SERVER_ERROR;
+        /* Can't return error from child_init, just log warning */
+        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, s,
+                     "mod_webp: Continuing with potentially incompatible libwebp version");
     }
-
-    return OK;
 }
 
 /* Configuration validation hook */
